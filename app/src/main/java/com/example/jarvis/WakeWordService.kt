@@ -1,7 +1,5 @@
 package com.example.jarvis
 
-import ai.picovoice.porcupine.Porcupine
-import ai.picovoice.porcupine.PorcupineManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -18,10 +16,18 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import java.util.Locale
 
+/**
+ * Always-listening loop using Android's built-in speech recognition (no Picovoice needed).
+ * Say "Jarvis open WhatsApp" in one sentence, or say "Jarvis", wait for "Yes?", then the command.
+ */
 class WakeWordService : Service() {
-    private var porcupine: PorcupineManager? = null
+    private var sr: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private val main = Handler(Looper.getMainLooper())
+    private var running = false
+    private var busy = false
+    private var waitingCommand = false
+    private val wake = Regex("jarvis|jervis|jarvi|service")
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -32,51 +38,73 @@ class WakeWordService : Service() {
         val n = Notification.Builder(this, ch).setContentTitle("Jarvis is listening")
             .setSmallIcon(android.R.drawable.ic_btn_speak_now).build()
         startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-        tts = TextToSpeech(this) { tts?.language = Locale.getDefault() }
-        startWake()
+        if (!running) {
+            running = true
+            tts = TextToSpeech(this) { tts?.language = Locale.getDefault() }
+            main.postDelayed({ listen() }, 1000)
+        }
         return START_STICKY
-    }
-
-    private fun startWake() {
-        val key = Prefs.get(this).getString("pico", "") ?: ""
-        porcupine = PorcupineManager.Builder()
-            .setAccessKey(key)
-            .setKeyword(Porcupine.BuiltInKeyword.JARVIS)
-            .build(this) { main.post { porcupine?.stop(); listen() } }
-        porcupine?.start()
     }
 
     private fun speak(t: String) { tts?.speak(t, TextToSpeech.QUEUE_ADD, null, "j") }
 
     private fun listen() {
-        speak("Yes?")
-        main.postDelayed({
-            val sr = SpeechRecognizer.createSpeechRecognizer(this)
-            sr.setRecognitionListener(object : RecognitionListener {
-                override fun onResults(b: Bundle?) {
-                    val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                    sr.destroy()
-                    if (t == null) { porcupine?.start(); return }
-                    Thread {
-                        AgentLoop.run(this@WakeWordService, t) { s -> main.post { speak(s) } }
-                        main.post { porcupine?.start() }
-                    }.start()
-                }
-                override fun onError(e: Int) { sr.destroy(); porcupine?.start() }
-                override fun onReadyForSpeech(p: Bundle?) {}
-                override fun onBeginningOfSpeech() {}
-                override fun onRmsChanged(v: Float) {}
-                override fun onBufferReceived(b: ByteArray?) {}
-                override fun onEndOfSpeech() {}
-                override fun onPartialResults(b: Bundle?) {}
-                override fun onEvent(t: Int, b: Bundle?) {}
-            })
-            sr.startListening(
-                Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-                    .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            )
-        }, 1200)
+        if (!running || busy) return
+        sr?.destroy()
+        val r = SpeechRecognizer.createSpeechRecognizer(this)
+        sr = r
+        r.setRecognitionListener(object : RecognitionListener {
+            override fun onResults(b: Bundle?) {
+                val t = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                    ?.firstOrNull()?.trim().orEmpty()
+                handle(t)
+            }
+            override fun onError(e: Int) { main.postDelayed({ listen() }, 500) }
+            override fun onReadyForSpeech(p: Bundle?) {}
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(v: Float) {}
+            override fun onBufferReceived(b: ByteArray?) {}
+            override fun onEndOfSpeech() {}
+            override fun onPartialResults(b: Bundle?) {}
+            override fun onEvent(t: Int, b: Bundle?) {}
+        })
+        r.startListening(
+            Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        )
     }
 
-    override fun onDestroy() { porcupine?.delete(); tts?.shutdown(); super.onDestroy() }
+    private fun handle(text: String) {
+        if (waitingCommand) {
+            waitingCommand = false
+            if (text.isNotEmpty()) { run(text); return }
+            listen(); return
+        }
+        val m = wake.find(text.lowercase())
+        if (m == null) { listen(); return }
+        val cmd = text.substring(m.range.last + 1).trim(' ', ',', '.', '!', '?')
+        if (cmd.isEmpty()) {
+            waitingCommand = true
+            speak("Yes?")
+            main.postDelayed({ listen() }, 1000)
+        } else {
+            run(cmd)
+        }
+    }
+
+    private fun run(cmd: String) {
+        busy = true
+        sr?.destroy(); sr = null
+        Thread {
+            AgentLoop.run(this, cmd) { s -> main.post { speak(s) } }
+            main.postDelayed({ busy = false; listen() }, 2000)
+        }.start()
+    }
+
+    override fun onDestroy() {
+        running = false
+        sr?.destroy()
+        tts?.shutdown()
+        super.onDestroy()
+    }
 }
